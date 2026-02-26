@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Видеозвонок 1-на-1</title>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin:0; background:#121212; color:#00ff88; text-align:center; }
+    h1 { margin-top: 20px; }
+    .video-container { display: flex; justify-content: center; gap: 20px; flex-wrap: wrap; margin-top: 20px; }
+    video { width: 45%; max-width: 600px; border: 3px solid #00ff88; border-radius: 12px; background: #000; box-shadow: 0 0 15px rgba(0, 255, 136, 0.2); }
+    #local { transform: scaleX(-1); }
+    #status { font-size: 1.2em; margin: 20px; padding: 10px; background: #1e1e1e; display: inline-block; border-radius: 8px; }
+    #chat { width: 90%; max-width: 600px; margin: 30px auto; text-align: left; background: #1e1e1e; padding: 15px; border-radius: 12px; }
+    #messages { height: 200px; overflow-y: auto; margin-bottom: 10px; padding-right: 10px; }
+    .msg { margin: 8px 0; padding: 8px; background: #2a2a2a; border-radius: 6px; }
+    .msg b { color: #fff; }
+    .input-group { display: flex; gap: 10px; }
+    input { flex: 1; padding: 12px; border: 1px solid #333; border-radius: 6px; background: #111; color: #fff; outline: none; }
+    input:focus { border-color: #00ff88; }
+    button { padding: 12px 20px; background: #00ff88; color: #000; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; }
+    button:hover { background: #00cc6a; }
+  </style>
+</head>
+<body>
+  <h1>🎥 Видеозвонок</h1>
+  <div id="status">Подключение к серверу...</div>
+
+  <div class="video-container">
+    <video id="local" autoplay muted playsinline></video>
+    <video id="remote" autoplay playsinline></video>
+  </div>
+
+  <div id="chat">
+    <div id="messages"></div>
+    <div class="input-group">
+      <input id="msgInput" placeholder="Напишите сообщение..." autocomplete="off">
+      <button onclick="sendChat()">Отправить</button>
+    </div>
+  </div>
+
+  <script>
+    const socket = io();
+    let localStream, peerConnection, myRole;
+    
+    // Расширенный список STUN серверов для лучшей пробиваемости NAT
+    const config = { 
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' }
+      ] 
+    };
+
+    const localVideo = document.getElementById('local');
+    const remoteVideo = document.getElementById('remote');
+    const statusEl = document.getElementById('status');
+    const messages = document.getElementById('messages');
+
+    async function startMedia() {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localVideo.srcObject = localStream;
+        socket.emit('media-ready'); // Сообщаем серверу, что камера работает
+      } catch (err) {
+        statusEl.innerHTML = '❌ Ошибка доступа к камере или микрофону.';
+        console.error('Ошибка медиа:', err);
+      }
+    }
+
+    function createPeer() {
+      if (peerConnection) peerConnection.close(); // Очищаем старое соединение если есть
+      peerConnection = new RTCPeerConnection(config);
+      
+      localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+      
+      peerConnection.ontrack = e => {
+        remoteVideo.srcObject = e.streams[0];
+      };
+      
+      peerConnection.onicecandidate = e => {
+        if (e.candidate) socket.emit('ice-candidate', e.candidate);
+      };
+    }
+
+    socket.on('status', async (state, role) => {
+      if (state === 'busy') {
+        statusEl.innerHTML = '❌ Комната занята. Попробуйте позже.';
+        return;
+      }
+      myRole = role;
+      statusEl.innerHTML = `Вы — <b>Абонент ${role}</b>. Ожидание второго участника...`;
+      await startMedia();
+    });
+
+    socket.on('start-call', async () => {
+      statusEl.innerHTML = `Вы — <b>Абонент ${myRole}</b>. Соединение установлено! 🔒`;
+      createPeer();
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      socket.emit('offer', offer);
+    });
+
+    socket.on('offer', async (offer) => {
+      statusEl.innerHTML = `Вы — <b>Абонент ${myRole}</b>. Соединение установлено! 🔒`;
+      createPeer();
+      await peerConnection.setRemoteDescription(offer);
+      const answer = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answer);
+      socket.emit('answer', answer);
+    });
+
+    socket.on('answer', async (answer) => {
+      await peerConnection.setRemoteDescription(answer);
+    });
+
+    socket.on('ice-candidate', async (candidate) => {
+      if (peerConnection) {
+        try {
+          await peerConnection.addIceCandidate(candidate);
+        } catch (e) {
+          console.error('Ошибка добавления ICE кандидата', e);
+        }
+      }
+    });
+
+    socket.on('chat', (data) => {
+      addMessageToChat(`Абонент ${data.from}`, data.text);
+    });
+
+    socket.on('reset', () => {
+      statusEl.innerHTML = `Партнёр отключился. Ожидание нового участника...`;
+      if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+      }
+      remoteVideo.srcObject = null;
+    });
+
+    function addMessageToChat(sender, text) {
+      const div = document.createElement('div');
+      div.className = 'msg';
+      // Используем textContent для защиты от XSS инъекций
+      const b = document.createElement('b');
+      b.textContent = sender + ': ';
+      div.appendChild(b);
+      div.appendChild(document.createTextNode(text));
+      
+      messages.appendChild(div);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function sendChat() {
+      const input = document.getElementById('msgInput');
+      const text = input.value.trim();
+      if (text) {
+        socket.emit('chat', text);
+        addMessageToChat('Я', text);
+        input.value = '';
+      }
+    }
+
+    document.getElementById('msgInput').addEventListener('keypress', e => {
+      if (e.key === 'Enter') sendChat();
+    });
+  </script>
+</body>
+</html>
